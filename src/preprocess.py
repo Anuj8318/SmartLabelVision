@@ -3,7 +3,6 @@ import numpy as np
 from skimage import exposure
 import logging
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -30,62 +29,118 @@ def resize_image(image, target_size=(1000, 1000)):
         new_w = int(new_h * aspect)
     return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-def preprocess_image(image_path, target_size=(1000, 1000), gamma=1.5, clip_limit=2.0):
-    """Load, resize, and preprocess an image for OCR with configurable parameters."""
-    image = load_image(image_path)
+def enhance_contrast(image):
+    """Enhance contrast using CLAHE."""
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    enhanced_lab = cv2.merge((cl, a, b))
+    return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+
+def denoise_image(image):
+    """Apply non-local means denoising."""
+    return cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
+
+def sharpen_image(image):
+    """Sharpen the image using unsharp masking."""
+    gaussian = cv2.GaussianBlur(image, (0, 0), 3.0)
+    return cv2.addWeighted(image, 1.5, gaussian, -0.5, 0, image)
+
+def adjust_gamma(image, gamma=1.0):
+    """Adjust the image gamma."""
+    inv_gamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
+    return cv2.LUT(image, table)
+
+def create_text_mask(image):
+    """Create a mask to isolate text-like regions using Sobel and Canny edge detection."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Sobel gradients
+    grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    gradient = np.sqrt(grad_x**2 + grad_y**2)
+    gradient = np.uint8(gradient / gradient.max() * 255)
+
+    # Combine with Canny edge detection
+    edges = cv2.Canny(gray, 50, 150)
+    combined_edges = cv2.addWeighted(gradient, 0.5, edges, 0.5, 0)
+    
+    # Threshold and morphological operations
+    _, thresh = cv2.threshold(combined_edges, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    text_mask = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    
+    return text_mask
+
+def remove_background(image):
+    """Remove background using GrabCut algorithm."""
+    mask = np.zeros(image.shape[:2], np.uint8)
+    bgdModel = np.zeros((1,65), np.float64)
+    fgdModel = np.zeros((1,65), np.float64)
+    rect = (20, 20, image.shape[1]-20, image.shape[0]-20)
+    cv2.grabCut(image, mask, rect, bgdModel, fgdModel, 5, cv2.GC_INIT_WITH_RECT)
+    mask2 = np.where((mask==2)|(mask==0), 0, 1).astype('uint8')
+    return image * mask2[:,:,np.newaxis]
+
+def preprocess_image(image_path, target_size=(1000, 1000)):
+    """Preprocess the image for optimal OCR performance."""
+    logger.info(f"Loading image from {image_path}")
+    
+    # Load the image
+    image = cv2.imread(image_path)
+    
     if image is None:
-        return None
+        logger.error(f"Failed to load image from {image_path}. Check if the file exists and the format is supported.")
+        return None, None
+    
+    logger.info(f"Image loaded successfully. Image shape: {image.shape}")
 
     try:
-        # Step 1: Resize
+        # Resize the image
         image = resize_image(image, target_size)
-
-        # Step 2: Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # Step 3: Denoise and Enhance Contrast in a Single Step
-        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8,8))
-        contrast_enhanced = clahe.apply(denoised)
-
-        # Step 4: Gamma Correction
-        gamma_corrected = exposure.adjust_gamma(contrast_enhanced, gamma)
-
-        # Step 5: Sharpening
-        sharpened = cv2.GaussianBlur(gamma_corrected, (0, 0), 3)
-        sharpened = cv2.addWeighted(gamma_corrected, 1.5, sharpened, -0.5, 0)
-
-        # Step 6: Binarization
-        binary = cv2.adaptiveThreshold(sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, 11, 2)
-
-        # Step 7: Deskew
-        coords = np.column_stack(np.where(binary > 0))
-        angle = cv2.minAreaRect(coords)[-1]
-        if angle < -45:
-            angle = -(90 + angle)
-        else:
-            angle = -angle
-        (h, w) = binary.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        deskewed = cv2.warpAffine(binary, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
-        return deskewed
+        
+        # Remove background
+        image = remove_background(image)
+        
+        # Enhance contrast and denoise
+        enhanced = enhance_contrast(image)
+        denoised = denoise_image(enhanced)
+        
+        # Sharpen and adjust gamma
+        sharpened = sharpen_image(denoised)
+        gamma_corrected = adjust_gamma(sharpened, 1.2)
+        
+        # Create text mask
+        text_mask = create_text_mask(gamma_corrected)
+        
+        # Apply text mask to the original image
+        text_regions = cv2.bitwise_and(gamma_corrected, gamma_corrected, mask=text_mask)
+        
+        # Final binarization
+        gray = cv2.cvtColor(text_regions, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        logger.info("Preprocessing completed successfully.")
+        return binary, gamma_corrected  # Return both binary and processed color image
 
     except Exception as e:
         logger.error(f"Error during image preprocessing: {str(e)}")
-        return None
+        return None, None
+
+def main():
+    image_path = "C:/Users/aj/Desktop/SmartLabelVision/tests/data/IMG_20220318_180632.jpg"
+    
+    # Capture both return values from preprocess_image
+    binary, color_processed = preprocess_image(image_path)
+    
+    if binary is not None and color_processed is not None:
+        cv2.imwrite("preprocessed_binary.jpg", binary)
+        cv2.imwrite("preprocessed_color.jpg", color_processed)
+        logger.info("Preprocessed images saved successfully.")
+    else:
+        logger.error("Preprocessing failed.")
 
 if __name__ == "__main__":
-    test_image_path = "C:/Users/aj\Desktop/SmartLabelVision/tests/data/IMG_20220318_153035.jpg"
-    processed_image = preprocess_image(test_image_path, target_size=(1000, 1000), gamma=1.5, clip_limit=2.0)
-    
-    if processed_image is not None:
-        cv2.imshow("Processed Image", processed_image)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-        cv2.imwrite("processed_image.jpg", processed_image)
-        logger.info("Processed image saved as 'processed_image.jpg'")
-    else:
-        logger.error("Failed to process the image")
+    main()
