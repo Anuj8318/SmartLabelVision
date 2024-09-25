@@ -130,7 +130,7 @@ def preprocess_image(image_path, target_size=(1000, 1000)):
         return None, None
 
 def main():
-    image_path = "C:/Users/aj/Desktop/SmartLabelVision/tests/data/IMG_20220318_180632.jpg"
+    image_path = "C:/Users/aj/Desktop/SmartLabelVision/tests/data/nescafe-classic-instant-coffee-45-g-product-images-o490004155-p490004155-0-202309041728.webp"
     
     # Capture both return values from preprocess_image
     binary, color_processed = preprocess_image(image_path)
